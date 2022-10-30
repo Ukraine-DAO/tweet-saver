@@ -1,0 +1,8 @@
+runtime: go116
+automatic_scaling:
+  min_instances: 1
+  max_instances: 1
+  min_idle_instances: 1
+app_engine_apis: true
+inbound_services:
+  - warmup

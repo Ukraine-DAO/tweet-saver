@@ -118,8 +118,13 @@ func main() {
 		log.Fatalf("Failed to get bot user ID: %s", err)
 	}
 
+	rebuild := make(chan struct{})
 	http.Handle("/", twitterlogin.LoginHandler(oauth1Config, nil))
 	http.Handle("/oauth_callback", twitterlogin.CallbackHandler(oauth1Config, loginHandler(ds, botUserID.Text), nil))
+	http.HandleFunc("/rebuild", func(w http.ResponseWriter, r *http.Request) {
+		rebuild <- struct{}{}
+		fmt.Fprintln(w, "ok")
+	})
 	http.HandleFunc("/_ah/warmup", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
@@ -131,7 +136,7 @@ func main() {
 	}
 
 	go func() {
-		if err := PollDMs(ctx, ds); err != nil {
+		if err := PollDMs(ctx, ds, rebuild); err != nil {
 			log.Fatal(err)
 		}
 	}()

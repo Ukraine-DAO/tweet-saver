@@ -27,7 +27,7 @@ func stringify(v interface{}) string {
 	return string(b)
 }
 
-func PollDMs(ctx context.Context, ds *datastore.Client) error {
+func PollDMs(ctx context.Context, ds *datastore.Client, rebuild <-chan struct{}) error {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	if err := pollDMsOnce(ctx, ds); err != nil {
@@ -35,6 +35,13 @@ func PollDMs(ctx context.Context, ds *datastore.Client) error {
 	}
 	for {
 		select {
+		case <-rebuild:
+			log.Printf("Rebuilding the spreadsheet...")
+			if err := rebuildSpreadsheet(ctx); err != nil {
+				log.Printf("Failed to rebuild the spreadsheet: %s", err)
+			} else {
+				log.Printf("Spreadsheet rebuilt successfully")
+			}
 		case <-t.C:
 			if err := pollDMsOnce(ctx, ds); err != nil {
 				log.Printf("Failed to poll DMs: %s", err)
@@ -115,13 +122,26 @@ func pollDMsOnce(ctx context.Context, ds *datastore.Client) error {
 	events := []twitter.DirectMessageEvent{}
 	cursor := ""
 	for {
-		resp, _, err := twClient.DirectMessages.EventsList(&twitter.DirectMessageEventsListParams{Cursor: cursor, Count: 50})
+		resp, httpResp, err := twClient.DirectMessages.EventsList(&twitter.DirectMessageEventsListParams{Cursor: cursor, Count: 50})
+		log.Printf("%s", stringify(httpResp))
+		log.Printf("%s", stringify(resp))
 		if err != nil {
+			if apiError, ok := err.(twitter.APIError); ok {
+				if len(apiError.Errors) > 0 && apiError.Errors[0].Code == 88 {
+					// Throttled
+					log.Printf("Throttled, sleeping for a bit")
+					time.Sleep(15 * time.Minute)
+					continue
+				}
+			}
 			return fmt.Errorf("failed to fetch DMs: %w", err)
 		}
-		cursor := resp.NextCursor
+		cursor = resp.NextCursor
+
+		log.Printf("Got %d events", len(resp.Events))
 
 		for _, e := range resp.Events {
+			log.Printf("%s", e.ID)
 			if e.Type != "message_create" {
 				continue
 			}
@@ -145,6 +165,7 @@ func pollDMsOnce(ctx context.Context, ds *datastore.Client) error {
 			break
 		}
 	}
+	log.Printf("DMs fetched")
 
 	sort.Slice(events, func(i, j int) bool {
 		a := events[i].CreatedAt
@@ -205,14 +226,14 @@ func pollDMsOnce(ctx context.Context, ds *datastore.Client) error {
 				continue
 			}
 
-			tweet, _, err := twClient.Statuses.Show(id, &twitter.StatusShowParams{IncludeEntities: twitter.Bool(true)})
+			tweet, _, err := twClient.Statuses.Show(id, &twitter.StatusShowParams{IncludeEntities: twitter.Bool(true), TweetMode: "extended"})
 			if err != nil {
 				log.Printf("Failed to fetch tweet %s: %s", tweetID, err)
 				continue
 			}
-			data["tweet"] = tweet
+
 			data["notes"] = groupToNotes(group, tweetID)
-			data["url"] = fmt.Sprintf("https://twitter.com/%s/status/%s", tweet.User.ScreenName, tweet.IDStr)
+			updateComputedFields(data, tweet)
 
 			row, err := tweetToRow(data, header)
 			if err != nil {
@@ -228,6 +249,16 @@ func pollDMsOnce(ctx context.Context, ds *datastore.Client) error {
 		}
 	}
 	return nil
+}
+
+func updateComputedFields(data map[string]interface{}, tweet *twitter.Tweet) {
+	text := tweet.Text
+	if text == "" {
+		text = tweet.FullText
+	}
+	data["text"], data["mentions"] = splitTweetText(expandURLs(text, tweet.Entities.Urls))
+	data["tweet"] = tweet
+	data["url"] = fmt.Sprintf("https://twitter.com/%s/status/%s", tweet.User.ScreenName, tweet.IDStr)
 }
 
 func getSheetHeader(ctx context.Context, sheetsService *sheets.Service, spreadsheetID string) ([]string, error) {
@@ -390,4 +421,124 @@ func tweetToRow(data map[string]interface{}, header []string) ([]interface{}, er
 		r = append(r, lookup(field))
 	}
 	return r, nil
+}
+
+func splitTweetText(s string) (string, string) {
+	re := regexp.MustCompile("^(@[^ ]+ )+")
+	mentions := re.FindString(s)
+	return strings.TrimPrefix(s, mentions), strings.TrimSpace(mentions)
+}
+
+func rebuildSpreadsheet(ctx context.Context) error {
+	rcService, err := runtimeconfig.NewService(ctx)
+	if err != nil {
+		return err
+	}
+	vars := rcService.Projects.Configs.Variables
+	spreadsheetID, err := vars.Get(fmt.Sprintf("projects/%s/configs/prod/variables/%s", os.Getenv("GOOGLE_CLOUD_PROJECT"), "spreadsheet_id")).Do()
+	if err != nil {
+		return fmt.Errorf("fetching spreadsheet_id: %w", err)
+	}
+	sheetsService, err := sheets.NewService(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create sheets service: %w", err)
+	}
+
+	header, err := getSheetHeader(ctx, sheetsService, spreadsheetID.Text)
+	if err != nil {
+		return fmt.Errorf("getting spreadsheet header: %w", err)
+	}
+
+	rows, err := sheetsService.Spreadsheets.Values.Get(spreadsheetID.Text, fmt.Sprintf("Tweets!R2C1:C%d", len(header))).MajorDimension("ROWS").Do()
+	if err != nil {
+		return fmt.Errorf("failed to get spreadsheet data: %w", err)
+	}
+
+	jsonColumnNumber := -1
+	for i, h := range header {
+		if h == "json" {
+			jsonColumnNumber = i
+		}
+	}
+	if jsonColumnNumber < 0 {
+		return fmt.Errorf("missing \"json\" column in the spreadsheet")
+	}
+
+	data := [][]interface{}{}
+	for i, row := range rows.Values {
+		updated, err := rebuildRow(row[jsonColumnNumber], header)
+		if err != nil {
+			log.Printf("Failed to rebuild row %d: %s", i+2, err)
+			data = append(data, row)
+			continue
+		}
+		data = append(data, updated)
+	}
+	if len(data) != len(rows.Values) {
+		return fmt.Errorf("something went wrong, len(data) != len(rows.Values): %d vs %d", len(data), len(rows.Values))
+	}
+
+	_, err = sheetsService.Spreadsheets.Values.Update(spreadsheetID.Text, fmt.Sprintf("Tweets!R2C1:R%dC%d", len(data)+2, len(header)+1), &sheets.ValueRange{
+		Values: data,
+	}).ValueInputOption("USER_ENTERED").Do()
+	if err != nil {
+		return fmt.Errorf("failed to update values in the spreadsheet: %s", err)
+	}
+
+	return nil
+}
+
+func rebuildRow(v interface{}, header []string) ([]interface{}, error) {
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("expected a string, got %T instead", v)
+	}
+	data := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(s), &data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal the value: %w", err)
+	}
+	b, err := json.Marshal(data["tweet"])
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal tweet: %w", err)
+	}
+	tweet := &twitter.Tweet{}
+	if err := json.Unmarshal(b, tweet); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tweet: %w", err)
+	}
+	updateComputedFields(data, tweet)
+	return tweetToRow(data, header)
+}
+
+type replacement struct {
+	start int
+	end   int
+	text  string
+}
+
+func applyReplacements(s string, rs []replacement) string {
+	var r strings.Builder
+	sort.Slice(rs, func(i, j int) bool {
+		return rs[i].start < rs[j].start
+	})
+	ss := strings.Split(s, "")
+	prev := 0
+	for _, repl := range rs {
+		if repl.start < prev {
+			// Either a duplicate or some bug
+			continue
+		}
+		r.WriteString(strings.Join(ss[prev:repl.start], ""))
+		r.WriteString(repl.text)
+		prev = repl.end
+	}
+	r.WriteString(strings.Join(ss[prev:], ""))
+	return r.String()
+}
+
+func expandURLs(s string, urls []twitter.URLEntity) string {
+	repls := []replacement{}
+	for _, u := range urls {
+		repls = append(repls, replacement{u.Indices[0], u.Indices[1], u.ExpandedURL})
+	}
+	return applyReplacements(s, repls)
 }
